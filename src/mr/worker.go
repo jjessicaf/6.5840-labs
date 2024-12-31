@@ -132,11 +132,14 @@ func storeIntermediate(kva []KeyValue, nReduce int, X int) error {
 			}
 			files[partition] = file
 			encoders[partition] = json.NewEncoder(file)
-			defer files[partition].Close()
 		}
 		if err := encoders[partition].Encode(&kv); err != nil {
 			return fmt.Errorf("cannot encode kv pair: %w", err)
 		}
+	}
+
+	for _, file := range files {
+		file.Close()
 	}
 
 	return nil
