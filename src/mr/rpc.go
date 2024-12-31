@@ -30,14 +30,18 @@ type RequestTaskArgs struct {
 }
 
 type RequestTaskResponse struct {
-	filename string
+	Filename   string
+	TaskType   string
+	N          int
+	TaskNumber int
 }
 
-type StoreIntermediateArgs struct {
-	kva []KeyValue
+type TaskDoneArgs struct {
+	TaskType   string
+	TaskNumber int
 }
 
-type StoreIntermediateResponse struct {
+type TaskDoneResponse struct {
 }
 
 // Cook up a unique-ish UNIX-domain socket name

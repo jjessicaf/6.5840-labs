@@ -1,12 +1,15 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -14,6 +17,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -27,69 +38,157 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	for {
+		// Request a task
+		response := CallRequestTask()
 
-	// request a tasks
-	filename := CallRequestTask()
+		if response.TaskType == "done" {
+			log.Println("Worker: No more tasks, shutting down.")
+			break
+		}
+		if response.TaskType == "map" {
+			filename := response.Filename
 
-	var kva []KeyValue
-	// If received valid response, get intermediate output
-	if filename != "" {
-		// Read file and call application Map
-		file, err := os.Open(filename)
-		if err != nil {
-			log.Fatalf("cannot open %v", filename)
+			// Read file and call application Map
+			kva := performMap(filename, mapf)
+
+			// Each mapper should create nReduce intermediate files for consumption by the reduce tasks
+			storeIntermediate(kva, response.N, response.TaskNumber)
+
+			CallTaskDone(response.TaskType, response.TaskNumber)
 		}
-		content, err := ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("cannot read %v", filename)
+		if response.TaskType == "reduce" {
+			intermediate := getIntermediate(response.N, response.TaskNumber)
+
+			sort.Sort(ByKey(intermediate))
+
+			oname := fmt.Sprintf("mr-out-%d", response.TaskNumber)
+			performReduce(oname, intermediate, reducef)
+
+			CallTaskDone(response.TaskType, response.TaskNumber)
 		}
-		file.Close()
-		kva = mapf(filename, string(content))
+
+		time.Sleep(time.Second) // Workers to periodically ask the coordinator for work, sleeping with time.Sleep() between each request
 	}
-
-	// send the intermediate to the coordinator to put into bucket
-	// "a big difference from real MapReduce is that all the
-	// intermediate data is in one place, intermediate[],
-	// rather than being partitioned into NxM buckets."
-	CallStoreIntermediate(kva)
-
-	// uncomment to send the Example RPC to the coordinator.
-	//CallExample()
-
 }
 
-func CallRequestTask() string {
+func CallRequestTask() RequestTaskResponse {
 	// declare an argument structure.
 	args := RequestTaskArgs{}
 
 	// declare a reply structure.
 	reply := RequestTaskResponse{}
 
-	ok := call("Coordinator.RequestTask", &args, &reply)
-	if ok {
-		return reply.filename
-	} else {
-		return ""
-	}
+	call("Coordinator.RequestTask", &args, &reply)
+
+	return reply
 }
 
-func CallStoreIntermediate(kva []KeyValue) {
+func CallTaskDone(taskType string, taskNumber int) TaskDoneResponse {
 	// declare an argument structure.
-	args := StoreIntermediateArgs{}
-
-	// fill in the argument(s).
-	args.kva = kva
+	args := TaskDoneArgs{}
+	args.TaskType = taskType
+	args.TaskNumber = taskNumber
 
 	// declare a reply structure.
-	reply := StoreIntermediateResponse{}
+	reply := TaskDoneResponse{}
 
-	ok := call("Coordinator.StoreIntermediate", &args, &reply)
-	if ok {
-		fmt.Printf("sucessfully stored")
-	} else {
-		fmt.Printf("store intermediate failed!\n")
+	success := call("Coordinator.TaskDone", &args, &reply)
+	if !success {
+		log.Printf("Failed to report task completion: TaskType=%v, TaskNumber=%v", taskType, taskNumber)
 	}
+
+	return reply
+}
+
+func performMap(filename string, mapf func(string, string) []KeyValue) []KeyValue {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+
+	kva := mapf(filename, string(content))
+
+	return kva
+}
+
+// nReduce intermediate files to store intermediates, use hash() % nReduce to determine which bucket to assign to
+// Each mapper should create nReduce intermediate files for consumption by the reduce tasks
+func storeIntermediate(kva []KeyValue, nReduce int, X int) error {
+	files := make(map[int]*os.File)
+	encoders := make(map[int]*json.Encoder)
+	for _, kv := range kva {
+		partition := ihash(kv.Key) % nReduce
+		if _, exists := files[partition]; !exists {
+			filename := fmt.Sprintf("mr-%d-%d.txt", X, partition)
+			file, err := os.Create(filename)
+			if err != nil {
+				return fmt.Errorf("cannot create file %v: %w", filename, err)
+			}
+			files[partition] = file
+			encoders[partition] = json.NewEncoder(file)
+			defer files[partition].Close()
+		}
+		if err := encoders[partition].Encode(&kv); err != nil {
+			return fmt.Errorf("cannot encode kv pair: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func getIntermediate(numMapTasks int, partition int) []KeyValue {
+	var intermediate []KeyValue
+	for i := 0; i < numMapTasks; i++ {
+		filename := fmt.Sprintf("mr-%d-%d.txt", i, partition)
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
+
+	return intermediate
+}
+
+func performReduce(oname string, intermediate []KeyValue, reducef func(string, []string) string) {
+	ofile, err := os.Create(oname)
+	if err != nil {
+		log.Fatalf("cannot create file %v: %v", oname, err)
+	}
+
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
 }
 
 // example function to show how to make an RPC call to the coordinator.
