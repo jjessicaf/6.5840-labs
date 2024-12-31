@@ -106,9 +106,9 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-	// go through map tasks and check if they are done and how much time has elapsed
-
-	// go through reduce tasks and check if the yare done and how much time has elapsed
+	if c.mapDone && c.reduceDone {
+		ret = true
+	}
 
 	return ret
 }

@@ -48,24 +48,27 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 		if response.TaskType == "map" {
 			filename := response.Filename
+			tn := response.TaskNumber
 
 			// Read file and call application Map
 			kva := performMap(filename, mapf)
 
 			// Each mapper should create nReduce intermediate files for consumption by the reduce tasks
-			storeIntermediate(kva, response.N, response.TaskNumber)
+			storeIntermediate(kva, response.N, tn)
 
-			CallTaskDone(response.TaskType, response.TaskNumber)
+			CallTaskDone(response.TaskType, tn)
 		}
 		if response.TaskType == "reduce" {
-			intermediate := getIntermediate(response.N, response.TaskNumber)
+			tn := response.TaskNumber
+
+			intermediate := getIntermediate(response.N, tn)
 
 			sort.Sort(ByKey(intermediate))
 
-			oname := fmt.Sprintf("mr-out-%d", response.TaskNumber)
+			oname := fmt.Sprintf("mr-out-%d", tn)
 			performReduce(oname, intermediate, reducef)
 
-			CallTaskDone(response.TaskType, response.TaskNumber)
+			CallTaskDone(response.TaskType, tn)
 		}
 
 		time.Sleep(time.Second) // Workers to periodically ask the coordinator for work, sleeping with time.Sleep() between each request
@@ -79,7 +82,11 @@ func CallRequestTask() RequestTaskResponse {
 	// declare a reply structure.
 	reply := RequestTaskResponse{}
 
-	call("Coordinator.RequestTask", &args, &reply)
+	ok := call("Coordinator.RequestTask", &args, &reply)
+	if !ok {
+		// If the call fails, it likely means the coordinator has finished, so we return a "done" task.
+		reply.TaskType = "done"
+	}
 
 	return reply
 }
@@ -93,8 +100,8 @@ func CallTaskDone(taskType string, taskNumber int) TaskDoneResponse {
 	// declare a reply structure.
 	reply := TaskDoneResponse{}
 
-	success := call("Coordinator.TaskDone", &args, &reply)
-	if !success {
+	ok := call("Coordinator.TaskDone", &args, &reply)
+	if !ok {
 		log.Printf("Failed to report task completion: TaskType=%v, TaskNumber=%v", taskType, taskNumber)
 	}
 
