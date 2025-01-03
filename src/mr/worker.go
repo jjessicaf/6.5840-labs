@@ -42,15 +42,11 @@ func Worker(mapf func(string, string) []KeyValue,
 		// Request a task
 		response := CallRequestTask()
 
-		//log.Printf("Worker: assigned a %s task\n", response.TaskType)
-
 		if response.TaskType == "done" {
-			//log.Println("Worker: No more tasks, shutting down.")
 			break
 		}
 		if response.TaskType == "map" {
 			filename := response.Filename
-			//log.Printf("Worker: map task is %s\n", filename)
 			tn := response.TaskNumber
 
 			// Read file and call application Map
@@ -127,14 +123,13 @@ func performMap(filename string, mapf func(string, string) []KeyValue) []KeyValu
 	return kva
 }
 
-// nReduce intermediate files to store intermediates, use hash() % nReduce to determine which bucket to assign to
-// Each mapper should create nReduce intermediate files for consumption by the reduce tasks
+// nReduce intermediate files to store intermediates, use hash() % nReduce to determine which bucket to assign to.
+// Each mapper should create nReduce intermediate files for consumption by the reduce tasks.
 func storeIntermediate(kva []KeyValue, nReduce int, X int) error {
 	files := make(map[int]*os.File)
 	encoders := make(map[int]*json.Encoder)
 	for i := 0; i < nReduce; i++ {
 		filename := fmt.Sprintf("mr-%d-%d.txt", X, i)
-		//log.Printf("Storing intermediate file: mr-%d-%d.txt", X, i)
 		file, err := os.Create(filename)
 		if err != nil {
 			return fmt.Errorf("cannot create file %v: %w", filename, err)
@@ -148,7 +143,6 @@ func storeIntermediate(kva []KeyValue, nReduce int, X int) error {
 			return fmt.Errorf("cannot encode kv pair: %w", err)
 		}
 	}
-
 	for _, file := range files {
 		file.Close()
 	}
