@@ -1,4 +1,6 @@
-pkg/
-api.key
-.api.key.trimmed
-*-handin.tar.gz
+# Ignore all mr-[numbers]-[numbers].txt files
+mr-*-*.txt
+
+# Ignore all mr-out-[numbers] files
+mr-out-*
+

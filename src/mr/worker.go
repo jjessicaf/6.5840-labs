@@ -42,6 +42,8 @@ func Worker(mapf func(string, string) []KeyValue,
 		// Request a task
 		response := CallRequestTask()
 
+		log.Printf("Worker: assigned a %s task\n", response.TaskType)
+
 		if response.TaskType == "done" {
 			log.Println("Worker: No more tasks, shutting down.")
 			break

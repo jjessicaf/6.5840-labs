@@ -40,15 +40,31 @@ type Coordinator struct {
 // Your code here -- RPC handlers for the worker to call.
 
 func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskResponse) error {
+	c.mapTasksMu.Lock()
 	if !c.mapDone {
+		log.Printf("Coordinator: assigning a map task. Total map tasks completed: %d\n", c.mapTasksCompleted)
 		if !c.assignTask(c.mapTasks, "map", c.nReduce, reply) {
-			return fmt.Errorf("failed to assign map task")
+			reply.TaskType = "none"
 		}
-	} else if !c.reduceDone {
+
+		c.mapTasksMu.Unlock()
+
+		return nil
+	}
+
+	log.Println("Coordinator: finished map tasks")
+
+	c.mapTasksMu.Unlock()
+	c.reduceTasksMu.Lock()
+
+	if !c.reduceDone {
+		log.Printf("Coordinator: assigning a reduce task. Total reduce tasks completed: %d\n", c.reduceTasksCompleted)
 		if !c.assignTask(c.reduceTasks, "reduce", len(c.mapTasks), reply) {
-			return fmt.Errorf("failed to assign reduce task")
+			reply.TaskType = "none"
 		}
 	}
+
+	c.reduceTasksMu.Unlock()
 
 	return nil
 }
@@ -68,6 +84,7 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneResponse) erro
 	if args.TaskType == "map" && 0 <= i && i < len(c.mapTasks) {
 		c.mapTasks[i].status = Complete
 		c.mapTasksCompleted += 1
+
 		if c.mapTasksCompleted >= len(c.mapTasks) {
 			c.mapDone = true
 		}
@@ -88,16 +105,6 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneResponse) erro
 }
 
 func (c *Coordinator) assignTask(tasks []Task, taskType string, n int, reply *RequestTaskResponse) bool {
-	var mu *sync.Mutex
-	if taskType == "map" {
-		mu = &c.mapTasksMu
-	} else {
-		mu = &c.reduceTasksMu
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
 	for i, task := range tasks {
 		if task.status == Unassigned {
 			reply.Filename = task.filename
@@ -170,6 +177,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.mapTasks = make([]Task, len(files))
 	for i, filename := range files {
 		c.mapTasks[i].filename = filename
+	}
+	c.reduceTasks = make([]Task, len(files))
+	for i := range files {
+		c.reduceTasks[i].filename = ""
 	}
 
 	c.server()
