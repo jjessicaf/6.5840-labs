@@ -51,8 +51,6 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskRespo
 		return nil
 	}
 
-	// log.Println("Coordinator: finished map tasks")
-
 	c.mapTasksMu.Unlock()
 	c.reduceTasksMu.Lock()
 
@@ -87,14 +85,14 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneResponse) erro
 		if c.mapTasksCompleted >= len(c.mapTasks) {
 			c.mapDone = true
 		}
-		log.Printf("Coordinator: map task %d. Total map tasks completed: %d\n", i, c.mapTasksCompleted)
+		//("Coordinator: map task %d. Total map tasks completed: %d\n", i, c.mapTasksCompleted)
 	} else if args.TaskType == "reduce" && 0 <= i && i < len(c.reduceTasks) {
 		c.reduceTasks[i].status = Complete
 		c.reduceTasksCompleted += 1
 		if c.reduceTasksCompleted >= len(c.reduceTasks) {
 			c.reduceDone = true
 		}
-		log.Printf("Coordinator: reduce task %d. Total reduce tasks completed: %d\n", i, c.reduceTasksCompleted)
+		//log.Printf("Coordinator: reduce task %d. Total reduce tasks completed: %d\n", i, c.reduceTasksCompleted)
 	} else {
 		if args.TaskType != "map" && args.TaskType != "reduce" {
 			return fmt.Errorf("invalid task type: %s", args.TaskType)
@@ -114,6 +112,7 @@ func (c *Coordinator) assignTask(tasks []Task, taskType string, n int, reply *Re
 			reply.TaskType = taskType
 			reply.N = n
 			reply.TaskNumber = i
+			//log.Printf("Coordinator: Assigned %s task %d to worker. file: %s\n", taskType, i, task.filename)
 			return true
 		}
 	}
@@ -174,9 +173,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
-	log.Printf("Coordinator: total number of map tasks: %d", len(files))
+	//log.Printf("Coordinator: total number of map tasks: %d", len(files))
 	c.nReduce = nReduce
-	log.Printf("Coordinator: nReduce: %d, total number of reduce tasks: %d", nReduce, len(files)*nReduce)
+	//log.Printf("Coordinator: nReduce: %d, total number of reduce tasks: %d", nReduce, len(files)*nReduce)
 	c.mapTasks = make([]Task, len(files))
 	for i, filename := range files {
 		c.mapTasks[i].filename = filename

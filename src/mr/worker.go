@@ -42,14 +42,15 @@ func Worker(mapf func(string, string) []KeyValue,
 		// Request a task
 		response := CallRequestTask()
 
-		log.Printf("Worker: assigned a %s task\n", response.TaskType)
+		//log.Printf("Worker: assigned a %s task\n", response.TaskType)
 
 		if response.TaskType == "done" {
-			log.Println("Worker: No more tasks, shutting down.")
+			//log.Println("Worker: No more tasks, shutting down.")
 			break
 		}
 		if response.TaskType == "map" {
 			filename := response.Filename
+			//log.Printf("Worker: map task is %s\n", filename)
 			tn := response.TaskNumber
 
 			// Read file and call application Map
@@ -131,17 +132,18 @@ func performMap(filename string, mapf func(string, string) []KeyValue) []KeyValu
 func storeIntermediate(kva []KeyValue, nReduce int, X int) error {
 	files := make(map[int]*os.File)
 	encoders := make(map[int]*json.Encoder)
+	for i := 0; i < nReduce; i++ {
+		filename := fmt.Sprintf("mr-%d-%d.txt", X, i)
+		//log.Printf("Storing intermediate file: mr-%d-%d.txt", X, i)
+		file, err := os.Create(filename)
+		if err != nil {
+			return fmt.Errorf("cannot create file %v: %w", filename, err)
+		}
+		files[i] = file
+		encoders[i] = json.NewEncoder(file)
+	}
 	for _, kv := range kva {
 		partition := ihash(kv.Key) % nReduce
-		if _, exists := files[partition]; !exists {
-			filename := fmt.Sprintf("mr-%d-%d.txt", X, partition)
-			file, err := os.Create(filename)
-			if err != nil {
-				return fmt.Errorf("cannot create file %v: %w", filename, err)
-			}
-			files[partition] = file
-			encoders[partition] = json.NewEncoder(file)
-		}
 		if err := encoders[partition].Encode(&kv); err != nil {
 			return fmt.Errorf("cannot encode kv pair: %w", err)
 		}
