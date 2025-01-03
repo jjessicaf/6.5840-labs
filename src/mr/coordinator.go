@@ -42,23 +42,22 @@ type Coordinator struct {
 func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskResponse) error {
 	c.mapTasksMu.Lock()
 	if !c.mapDone {
-		log.Printf("Coordinator: assigning a map task. Total map tasks completed: %d\n", c.mapTasksCompleted)
+		// log.Printf("Coordinator: assigning a map task. Total map tasks completed: %d\n", c.mapTasksCompleted)
 		if !c.assignTask(c.mapTasks, "map", c.nReduce, reply) {
 			reply.TaskType = "none"
 		}
-
 		c.mapTasksMu.Unlock()
 
 		return nil
 	}
 
-	log.Println("Coordinator: finished map tasks")
+	// log.Println("Coordinator: finished map tasks")
 
 	c.mapTasksMu.Unlock()
 	c.reduceTasksMu.Lock()
 
 	if !c.reduceDone {
-		log.Printf("Coordinator: assigning a reduce task. Total reduce tasks completed: %d\n", c.reduceTasksCompleted)
+		// log.Printf("Coordinator: assigning a reduce task. Total reduce tasks completed: %d\n", c.reduceTasksCompleted)
 		if !c.assignTask(c.reduceTasks, "reduce", len(c.mapTasks), reply) {
 			reply.TaskType = "none"
 		}
@@ -88,12 +87,14 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneResponse) erro
 		if c.mapTasksCompleted >= len(c.mapTasks) {
 			c.mapDone = true
 		}
+		log.Printf("Coordinator: map task %d. Total map tasks completed: %d\n", i, c.mapTasksCompleted)
 	} else if args.TaskType == "reduce" && 0 <= i && i < len(c.reduceTasks) {
 		c.reduceTasks[i].status = Complete
 		c.reduceTasksCompleted += 1
 		if c.reduceTasksCompleted >= len(c.reduceTasks) {
 			c.reduceDone = true
 		}
+		log.Printf("Coordinator: reduce task %d. Total reduce tasks completed: %d\n", i, c.reduceTasksCompleted)
 	} else {
 		if args.TaskType != "map" && args.TaskType != "reduce" {
 			return fmt.Errorf("invalid task type: %s", args.TaskType)
@@ -173,15 +174,19 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
+	log.Printf("Coordinator: total number of map tasks: %d", len(files))
 	c.nReduce = nReduce
+	log.Printf("Coordinator: nReduce: %d, total number of reduce tasks: %d", nReduce, len(files)*nReduce)
 	c.mapTasks = make([]Task, len(files))
 	for i, filename := range files {
 		c.mapTasks[i].filename = filename
 	}
-	c.reduceTasks = make([]Task, len(files))
-	for i := range files {
+	c.reduceTasks = make([]Task, nReduce)
+	for i := 0; i < nReduce; i++ {
 		c.reduceTasks[i].filename = ""
 	}
+	c.mapTasksCompleted = 0
+	c.reduceTasksCompleted = 0
 
 	c.server()
 	return &c
