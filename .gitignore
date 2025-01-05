@@ -4,3 +4,4 @@ mr-*-*.txt
 # Ignore all mr-out-[numbers] files
 mr-out-*
 
+.vscode
