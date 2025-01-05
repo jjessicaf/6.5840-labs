@@ -3,6 +3,7 @@ package kvsrv
 import (
 	"crypto/rand"
 	"math/big"
+	"sync"
 
 	"6.5840/labrpc"
 )
@@ -10,6 +11,9 @@ import (
 type Clerk struct {
 	server *labrpc.ClientEnd
 	// You will have to modify this struct.
+	id    int64
+	seq   int
+	seqMu sync.Mutex
 }
 
 func nrand() int64 {
@@ -23,6 +27,8 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
 	// You'll have to add code here.
+	ck.id = nrand()
+	ck.seq = 0
 	return ck
 }
 
@@ -37,8 +43,10 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
+	ck.seqMu.Lock()
+	defer ck.seqMu.Unlock()
+
 	// declare an argument structure.
 	args := GetArgs{}
 
@@ -53,6 +61,8 @@ func (ck *Clerk) Get(key string) string {
 		ok = ck.server.Call("KVServer.Get", &args, &reply)
 	}
 
+	ck.seq += 1
+
 	return reply.Value
 }
 
@@ -66,13 +76,17 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
+	ck.seqMu.Lock()
+	defer ck.seqMu.Unlock()
+
 	// declare an argument structure.
 	args := PutAppendArgs{}
 
 	// fill in the argument(s).
 	args.Key = key
 	args.Value = value
-	args.Id = nrand()
+	args.ClientId = ck.id
+	args.Seq = ck.seq
 
 	// declare a reply structure.
 	reply := PutAppendReply{}
@@ -81,6 +95,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	for !ok {
 		ok = ck.server.Call("KVServer."+op, &args, &reply)
 	}
+
+	ck.seq += 1
 
 	return reply.Value
 }
