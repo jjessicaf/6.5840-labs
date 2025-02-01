@@ -19,8 +19,6 @@ package raft
 
 import (
 	//	"bytes"
-
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -95,7 +93,6 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (3A).
 	term = rf.currentTerm
-	//fmt.Printf("peer %d - term = %d, status = %d\n", rf.me, rf.currentTerm, rf.status)
 	isleader = rf.status == Leader
 	return term, isleader
 }
@@ -268,7 +265,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.status = Follower
-		//fmt.Printf("peer %d stepping down to term %d due to higher term from peer %d\n", rf.me, rf.currentTerm, args.LeaderId)
 	}
 
 	rf.lastHeartbeat = time.Now()
@@ -348,7 +344,6 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	rf.status = Follower
 	rf.votedFor = -1
-	//fmt.Printf("( :( ) peer %d killed: term %d\n", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) killed() bool {
@@ -378,6 +373,9 @@ func (rf *Raft) ticker() {
 			time.Sleep(timeout)
 		}
 	}
+	rf.mu.Lock()
+	rf.status = Follower
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) startElection() {
@@ -385,9 +383,8 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.lastHeartbeat = time.Now()
-	fmt.Printf("peer %d becoming candidate: term %d\n", rf.me, rf.currentTerm)
 	currentTerm := rf.currentTerm // Store current term for consistency
-	var votes int32 = 1           // Use atomic for safe increment
+	var votes int32 = 1
 	lastLogTerm := -1
 	if len(rf.log) > 0 {
 		lastLogTerm = rf.log[len(rf.log)-1].Term
@@ -417,11 +414,10 @@ func (rf *Raft) startElection() {
 						rf.status = Follower
 						rf.votedFor = -1
 						rf.lastHeartbeat = time.Now()
-						//fmt.Printf("peer %d stepping down to term %d due to higher term from peer %d\n", rf.me, rf.currentTerm, peer)
 						return
 					}
 					if reply.VoteGranted {
-						if atomic.AddInt32(&votes, 1) > int32(len(rf.peers)/2) {
+						if atomic.AddInt32(&votes, 1) > int32(len(rf.peers)/2) { // Use atomic for safe increment
 							if rf.status == Candidate {
 								rf.becomeLeader()
 								return
@@ -435,7 +431,6 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) heartbeatHelper() {
-	//fmt.Printf("hrlloZ? id: %d, status: %d\n", rf.me, rf.status)
 	if rf.status != Leader {
 		return
 	}
@@ -446,14 +441,9 @@ func (rf *Raft) heartbeatHelper() {
 		LeaderId: rf.me,
 	}
 
-	var successCount int32 = 1 // Start with 1 for self
-	//var wg sync.WaitGroup
-
 	for peer := range rf.peers {
 		if peer != rf.me {
-			//wg.Add(1)
 			go func(peer int) {
-				//defer wg.Done()
 				reply := AppendEntriesReply{}
 				if rf.sendAppendEntries(peer, &args, &reply) {
 					rf.mu.Lock()
@@ -466,27 +456,10 @@ func (rf *Raft) heartbeatHelper() {
 						rf.lastHeartbeat = time.Now()
 						return
 					}
-
-					if reply.Success {
-						atomic.AddInt32(&successCount, 1)
-					}
 				}
 			}(peer)
 		}
 	}
-
-	// Wait for all RPCs to complete
-	//wg.Wait()
-
-	// rf.mu.Lock()
-	// defer rf.mu.Unlock()
-
-	// // Check if the leader is still connected to a majority of nodes
-	// if atomic.LoadInt32(&successCount) <= int32(len(rf.peers)/2) {
-	// 	rf.status = Follower
-	// 	rf.lastHeartbeat = time.Now()
-	// 	fmt.Printf("Leader %d stepping down due to lack of majority\n", rf.me)
-	// }
 }
 
 func (rf *Raft) becomeLeader() {
@@ -498,19 +471,20 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[i] = 1 // Start from index 1
 		rf.matchIndex[i] = 0
 	}
-	fmt.Printf("!!! peer %d became leader: term %d\n", rf.me, rf.currentTerm)
 	rf.heartbeatHelper()
 }
 
 func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
 		if rf.status == Leader {
-			//fmt.Printf("ticker: peer %d is leader, sending heartbeat\n", rf.me)
 			// Leaders send heartbeats at fixed shorter intervals
 			rf.heartbeatHelper()
 			time.Sleep(150 * time.Millisecond)
 		}
 	}
+	rf.mu.Lock()
+	rf.status = Follower
+	rf.mu.Unlock()
 }
 
 // the service or tester wants to create a Raft server. the ports
