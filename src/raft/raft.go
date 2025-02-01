@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -355,20 +356,21 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (3A)
 		rf.mu.Lock()
-		if rf.status != Leader {
+		status := rf.status
+		rf.mu.Unlock()
+		if status != Leader {
 			// Followers wait for randomized election timeouts
 			ms := 500 + (rand.Int63() % 301)
 			timeout := time.Duration(ms) * time.Millisecond
+			rf.mu.Lock()
 			lastHeartbeat := rf.lastHeartbeat // Capture under lock
 			rf.mu.Unlock()
 
-			rf.mu.Lock()
 			if time.Since(lastHeartbeat) >= timeout &&
 				rf.status != Leader &&
 				len(rf.peers) > 1 {
 				rf.startElection()
 			}
-			rf.mu.Unlock()
 
 			time.Sleep(timeout)
 		}
@@ -379,11 +381,14 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) startElection() {
+	rf.mu.Lock()
 	rf.status = Candidate
 	rf.currentTerm++
+	//fmt.Printf("server %d starting election: term %d\n", rf.me, rf.currentTerm)
 	rf.votedFor = rf.me
 	rf.lastHeartbeat = time.Now()
 	currentTerm := rf.currentTerm // Store current term for consistency
+	rf.mu.Unlock()
 	var votes int32 = 1
 	lastLogTerm := -1
 	if len(rf.log) > 0 {
@@ -449,6 +454,8 @@ func (rf *Raft) heartbeatHelper() {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 
+					//fmt.Printf("\tserver %d responded to leader %d: term %d, leader term %d\n", peer, rf.me, reply.Term, rf.currentTerm)
+
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.status = Follower
@@ -464,6 +471,7 @@ func (rf *Raft) heartbeatHelper() {
 
 func (rf *Raft) becomeLeader() {
 	// Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server
+	//("server %d became leader: term %d\n", rf.me, rf.currentTerm)
 	rf.status = Leader
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -479,7 +487,7 @@ func (rf *Raft) heartbeat() {
 		if rf.status == Leader {
 			// Leaders send heartbeats at fixed shorter intervals
 			rf.heartbeatHelper()
-			time.Sleep(150 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 		}
 	}
 	rf.mu.Lock()
