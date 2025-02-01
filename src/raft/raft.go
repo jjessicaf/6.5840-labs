@@ -421,7 +421,7 @@ func (rf *Raft) startElection() {
 						rf.lastHeartbeat = time.Now()
 						return
 					}
-					if reply.VoteGranted {
+					if reply.VoteGranted && rf.currentTerm == args.Term {
 						if atomic.AddInt32(&votes, 1) > int32(len(rf.peers)/2) { // Use atomic for safe increment
 							if rf.status == Candidate {
 								rf.becomeLeader()
