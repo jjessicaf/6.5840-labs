@@ -59,7 +59,7 @@ const (
 )
 
 type LogEntry struct {
-	Command string
+	Command interface{}
 	Term    int
 }
 
@@ -81,9 +81,11 @@ type Raft struct {
 	lastApplied   int        // Index of highest log entry applied to state machine (initialized to 0, increases monotonically)
 	lastHeartbeat time.Time
 
-	status     Status
-	nextIndex  []int // For each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+	status       Status
+	replicateLog bool
+	applyCh      chan ApplyMsg
+	nextIndex    []int // For each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex   []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
 // return currentTerm and whether this server
@@ -190,6 +192,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLogTerm = rf.log[lastLogIndex].Term
 	}
 
+	/*
+		Handles 5.4.1: A candidate must contact a majority of the cluster
+		in order to be elected, which means that every committed
+		entry must be present in at least one of those servers. If the
+		candidate’s log is at least as up-to-date as any other log
+		in that majority (where “up-to-date” is defined precisely
+		below), then it will hold all the committed entries.
+
+		Raft determines which of two logs is more up-to-date
+		by comparing the index and term of the last entries in the
+		logs. If the logs have last entries with different terms, then
+		the log with the later term is more up-to-date. If the logs
+		end with the same term, then whichever log is longer is
+		more up-to-date.
+	*/
 	upToDate := (args.LastLogTerm > lastLogTerm) ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
 
@@ -272,7 +289,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.status = Follower
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-	if args.PrevLogIndex >= logLength || (args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+	if (args.PrevLogIndex) > logLength || (args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
@@ -282,10 +299,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// delete the existing entry and all that follow it
 	// Append any new entries not already in the log
 	for i, entry := range args.Entries {
-		if args.PrevLogIndex+1+i >= len(rf.log) {
+		logIndex := args.PrevLogIndex + 1 + i // Raft index where this entry should go
+		arrayIndex := logIndex - 1            // Array index
+		if arrayIndex >= len(rf.log) {
 			rf.log = append(rf.log, entry)
-		} else if rf.log[args.PrevLogIndex+1+i].Term != entry.Term {
-			rf.log = rf.log[:args.PrevLogIndex+1+i]
+		} else if rf.log[arrayIndex].Term != entry.Term {
+			rf.log = rf.log[:arrayIndex]
 			rf.log = append(rf.log, args.Entries[i:]...)
 			break
 		}
@@ -293,10 +312,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	//  If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
-		if args.LeaderCommit < len(rf.log)-1 {
+		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
+		if args.LeaderCommit < lastNewEntryIndex {
 			rf.commitIndex = args.LeaderCommit
 		} else {
-			rf.commitIndex = len(rf.log) - 1
+			rf.commitIndex = lastNewEntryIndex
 		}
 	}
 
@@ -327,6 +347,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Check if the server is the leader
+	if rf.status != Leader {
+		return -1, rf.currentTerm, false
+	}
+
+	// Append the command to the leader's log
+	entry := LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+	rf.log = append(rf.log, entry)
+
+	index = len(rf.log)
+	term = rf.currentTerm
+
+	//log.Printf("server %d: Starting command %v at index %d", rf.me, command, index)
+
+	// Attempt log replication
+	rf.replicateLog = true
 
 	return index, term, isLeader
 }
@@ -353,7 +395,7 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		// Your code here (3A)
 		rf.mu.Lock()
 		status := rf.status
@@ -365,6 +407,8 @@ func (rf *Raft) ticker() {
 			rf.mu.Lock()
 			lastHeartbeat := rf.lastHeartbeat // Capture under lock
 			rf.mu.Unlock()
+
+			//log.Printf("server %d waiting for heartbeat: term %d\n", rf.me, rf.currentTerm)
 
 			if time.Since(lastHeartbeat) >= timeout &&
 				rf.status != Leader &&
@@ -381,6 +425,7 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) startElection() {
+	//log.Printf("server %d starting election: term %d\n", rf.me, rf.currentTerm)
 	rf.mu.Lock()
 	rf.status = Candidate
 	rf.currentTerm++
@@ -442,19 +487,51 @@ func (rf *Raft) heartbeatHelper() {
 
 	term := rf.currentTerm
 	args := AppendEntriesArgs{
-		Term:     term,
-		LeaderId: rf.me,
+		Term:         term,
+		LeaderId:     rf.me,
+		LeaderCommit: rf.commitIndex,
 	}
+
+	//log.Printf("server %d: commitIndex %d, lastApplied: %d\n", rf.me, rf.commitIndex, rf.lastApplied)
 
 	for peer := range rf.peers {
 		if peer != rf.me {
 			go func(peer int) {
+				rf.mu.Lock()
+
+				if rf.status != Leader || rf.currentTerm != term {
+					rf.mu.Unlock()
+					return
+				}
+
+				nextIndex := rf.nextIndex[peer]
+				prevLogIndex := nextIndex - 1
+
+				if prevLogIndex > 0 {
+					args.PrevLogIndex = prevLogIndex
+					args.PrevLogTerm = rf.log[prevLogIndex-1].Term
+				} else {
+					args.PrevLogIndex = 0
+					args.PrevLogTerm = 0 // Invalid term for dummy entry
+				}
+
+				// Replicate log or heartbeat
+				if rf.replicateLog && nextIndex <= len(rf.log) {
+					args.Entries = rf.log[nextIndex-1:]
+				} else {
+					args.Entries = []LogEntry{}
+				}
+
+				rf.mu.Unlock()
+
 				reply := AppendEntriesReply{}
 				if rf.sendAppendEntries(peer, &args, &reply) {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 
-					//fmt.Printf("\tserver %d responded to leader %d: term %d, leader term %d\n", peer, rf.me, reply.Term, rf.currentTerm)
+					if rf.status != Leader || rf.currentTerm != args.Term {
+						return
+					}
 
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
@@ -462,6 +539,46 @@ func (rf *Raft) heartbeatHelper() {
 						rf.votedFor = -1
 						rf.lastHeartbeat = time.Now()
 						return
+					}
+
+					if reply.Success {
+						//log.Printf("server %d: AppendEntries succeeded for peer %d: prevLogIndex %d, logLength %d\n", rf.me, peer, args.PrevLogIndex, len(rf.log))
+						// Update nextIndex and matchIndex for the follower
+						if len(args.Entries) > 0 {
+							rf.nextIndex[peer] = args.PrevLogIndex + 1 + len(args.Entries)
+							rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+						}
+
+						// Check if we can update commitIndex
+						// Find the highest N such that a majority of matchIndex[i] ≥ N and log[N].term == currentTerm
+						for N := len(rf.log); N > rf.commitIndex; N-- {
+							if rf.log[N-1].Term == rf.currentTerm {
+								// Count servers that have replicated this entry
+								count := 1 // Leader itself
+								for i := range rf.peers {
+									if i != rf.me && rf.matchIndex[i] >= N {
+										count++
+									}
+								}
+
+								// If majority, update commitIndex
+								if count > len(rf.peers)/2 {
+									rf.commitIndex = N
+									// You might want to signal the application layer that new entries are committed
+									//log.Printf("server %d updated commitIndex to %d\n", rf.me, rf.commitIndex)
+									break
+								}
+							}
+						}
+					} else {
+						// If append failed because of log inconsistency, decrement nextIndex and retry
+						// This "walking back" approach guarantees that eventually the leader will find
+						// the point where the logs match (keep going back if conflicting)
+						if rf.nextIndex[peer] > 1 {
+							rf.nextIndex[peer]--
+						} else {
+							rf.nextIndex[peer] = 1 // Don't go below 1
+						}
 					}
 				}
 			}(peer)
@@ -471,7 +588,7 @@ func (rf *Raft) heartbeatHelper() {
 
 func (rf *Raft) becomeLeader() {
 	// Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server
-	//("server %d became leader: term %d\n", rf.me, rf.currentTerm)
+	//log.Printf("server %d became leader: term %d\n", rf.me, rf.currentTerm)
 	rf.status = Leader
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -483,7 +600,7 @@ func (rf *Raft) becomeLeader() {
 }
 
 func (rf *Raft) heartbeat() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		if rf.status == Leader {
 			// Leaders send heartbeats at fixed shorter intervals
 			rf.heartbeatHelper()
@@ -493,6 +610,47 @@ func (rf *Raft) heartbeat() {
 	rf.mu.Lock()
 	rf.status = Follower
 	rf.mu.Unlock()
+}
+
+// This function should be started as a goroutine when initializing your Raft instance
+func (rf *Raft) applyCommitted() {
+	for !rf.killed() { // Assuming you have a killed() method to check if the Raft instance is still alive
+		rf.mu.Lock()
+
+		// Check if there are new entries to apply
+		if rf.commitIndex > rf.lastApplied {
+			//log.Printf("server %d applying committed entries: term %d\n", rf.me, rf.currentTerm)
+			// Get all newly committed entries
+			entriesToApply := make([]LogEntry, 0, rf.commitIndex-rf.lastApplied)
+			applyIndices := make([]int, 0, rf.commitIndex-rf.lastApplied)
+			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				entriesToApply = append(entriesToApply, rf.log[i-1])
+				applyIndices = append(applyIndices, i)
+			}
+			rf.mu.Unlock()
+
+			// Apply each entry in order
+			for i, entry := range entriesToApply {
+				msg := ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Command,
+					CommandIndex: applyIndices[i],
+				}
+
+				// Send to application layer - this might block if channel is full
+				rf.applyCh <- msg
+
+				// Update lastApplied
+				rf.mu.Lock()
+				rf.lastApplied = applyIndices[i]
+				rf.mu.Unlock()
+			}
+		} else {
+			rf.mu.Unlock()
+			// Sleep a bit to avoid busy waiting
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -515,6 +673,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = []LogEntry{}
+	rf.applyCh = applyCh
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(peers))
@@ -534,6 +693,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start goroutine for leader to send heartbeats
 	go rf.heartbeat()
+
+	// start goroutine to check for newly committed entries
+	go rf.applyCommitted()
 
 	return rf
 }
