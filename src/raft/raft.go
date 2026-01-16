@@ -665,17 +665,129 @@ func (rf *Raft) startElection() {
 	}
 }
 
+func (rf *Raft) handleSendAppendEntries(peer int, args *AppendEntriesArgs) {
+	reply := AppendEntriesReply{}
+	if rf.sendAppendEntries(peer, args, &reply) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		if rf.status != Leader || rf.CurrentTerm != args.Term {
+			return
+		}
+
+		if reply.Term > rf.CurrentTerm {
+			rf.CurrentTerm = reply.Term
+			rf.status = Follower
+			rf.VotedFor = -1
+			rf.lastHeartbeat = time.Now()
+			rf.persist()
+			return
+		}
+
+		if reply.Success {
+			if debugMode {
+				log.Printf("server %d: AppendEntries succeeded for peer %d: prevLogIndex %d, logLength %d\n", rf.me, peer, args.PrevLogIndex)
+			}
+			// Update nextIndex and matchIndex for the follower
+			if len(args.Entries) > 0 {
+				rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+				if debugMode {
+					log.Printf("in here for peer %d: match idx: %d, next index: %d", peer, rf.matchIndex[peer], rf.nextIndex[peer])
+				}
+			}
+
+			// Check if we can update commitIndex
+			// Find the highest N such that a majority of matchIndex[i] ≥ N and log[N].term == currentTerm
+
+			// get all the values of matchIndex and the counts for each
+			// find the matchIndex value with the highest value that satisfies > len(rf.peers)/2
+			counts := make(map[int]int)
+			for i := range rf.peers {
+				if i != rf.me {
+					counts[rf.matchIndex[i]]++
+				}
+			}
+
+			nextCommitIndex := rf.commitIndex
+			isMajority := func(v int) bool {
+				return v > len(rf.peers)/2
+			}
+			for k, v := range counts {
+				if isMajority(v+1) && k > nextCommitIndex {
+					nextCommitIndex = k
+				}
+			}
+
+			rf.commitIndex = nextCommitIndex
+			if debugMode {
+				log.Printf("new commit index: %d", rf.commitIndex)
+			}
+
+		} else {
+			if debugMode {
+				log.Printf("server %d: AppendEntries failed for peer %d: prevLogIndex %d, logLength %d\n", rf.me, peer, args.PrevLogIndex)
+			}
+
+			// The below is an optimized version of:
+			// If append failed because of log inconsistency, decrement nextIndex and retry
+			// This "walking back" approach guarantees that eventually the leader will find
+			// the point where the logs match (keep going back if conflicting)
+
+			// 	Case 1: leader doesn't have XTerm:
+			// 	nextIndex = XIndex
+			//   Case 2: leader has XTerm:
+			// 	nextIndex = leader's last entry for XTerm
+			//   Case 3: follower's log is too short:
+			// 	nextIndex = XLen
+			findLastIndexOfTerm := func(term int) int {
+				index := -1
+				for i := 1; i < len(rf.Log); i++ {
+					if rf.Log[i].Term == term {
+						index = i + rf.lastIncludedIndex
+					}
+				}
+
+				return index
+			}
+			if reply.XLen != 0 {
+				// Case 3
+				rf.nextIndex[peer] = reply.XLen
+			} else {
+				// Look for XTerm in leader log
+				index := findLastIndexOfTerm(reply.XTerm)
+
+				if index == -1 {
+					// Case 1
+					rf.nextIndex[peer] = reply.XIndex
+				} else {
+					// Case 2
+					rf.nextIndex[peer] = index + 1
+				}
+			}
+
+			if rf.status == Leader {
+				go func() {
+					time.Sleep(10 * time.Millisecond)
+					if rf.status == Leader {
+						rf.sendHeartbeat()
+					}
+				}()
+			}
+		}
+	}
+}
+
 func (rf *Raft) sendHeartbeat() {
 	if rf.status != Leader {
 		return
 	}
 
-	term := rf.CurrentTerm
-
 	if debugMode {
 		log.Printf("In sendHeartbeat: server %d: commitIndex %d, lastApplied: %d\n", rf.me, rf.commitIndex, rf.lastApplied)
 	}
 
+	term := rf.CurrentTerm
 	for peer := range rf.peers {
 		if peer != rf.me {
 			go func(peer int) {
@@ -733,122 +845,9 @@ func (rf *Raft) sendHeartbeat() {
 					args.Entries = []LogEntry{}
 				}
 
-				if debugMode {
-					log.Printf("HERE")
-				}
-
 				rf.mu.Unlock()
 
-				reply := AppendEntriesReply{}
-				if rf.sendAppendEntries(peer, &args, &reply) {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-
-					if rf.status != Leader || rf.CurrentTerm != args.Term {
-						return
-					}
-
-					if reply.Term > rf.CurrentTerm {
-						rf.CurrentTerm = reply.Term
-						rf.status = Follower
-						rf.VotedFor = -1
-						rf.lastHeartbeat = time.Now()
-						rf.persist()
-						return
-					}
-
-					if reply.Success {
-						if debugMode {
-							log.Printf("server %d: AppendEntries succeeded for peer %d: prevLogIndex %d, logLength %d\n", rf.me, peer, args.PrevLogIndex, logLength)
-						}
-						// Update nextIndex and matchIndex for the follower
-						if len(args.Entries) > 0 {
-							rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
-							rf.nextIndex[peer] = rf.matchIndex[peer] + 1
-							if debugMode {
-								log.Printf("in here for peer %d: match idx: %d, next index: %d", peer, rf.matchIndex[peer], rf.nextIndex[peer])
-							}
-						}
-
-						// Check if we can update commitIndex
-						// Find the highest N such that a majority of matchIndex[i] ≥ N and log[N].term == currentTerm
-
-						// get all the values of matchIndex and the counts for each
-						// find the matchIndex value with the highest value that satisfies > len(rf.peers)/2
-						counts := make(map[int]int)
-						for i := range rf.peers {
-							if i != rf.me {
-								counts[rf.matchIndex[i]]++
-							}
-						}
-
-						nextCommitIndex := rf.commitIndex
-						isMajority := func(v int) bool {
-							return v > len(rf.peers)/2
-						}
-						for k, v := range counts {
-							if isMajority(v+1) && k > nextCommitIndex {
-								nextCommitIndex = k
-							}
-						}
-
-						rf.commitIndex = nextCommitIndex
-						if debugMode {
-							log.Printf("new commit index: %d", rf.commitIndex)
-						}
-
-					} else {
-						if debugMode {
-							log.Printf("server %d: AppendEntries failed for peer %d: prevLogIndex %d, logLength %d\n", rf.me, peer, args.PrevLogIndex, logLength)
-						}
-
-						// The below is an optimized version of:
-						// If append failed because of log inconsistency, decrement nextIndex and retry
-						// This "walking back" approach guarantees that eventually the leader will find
-						// the point where the logs match (keep going back if conflicting)
-
-						// 	Case 1: leader doesn't have XTerm:
-						// 	nextIndex = XIndex
-						//   Case 2: leader has XTerm:
-						// 	nextIndex = leader's last entry for XTerm
-						//   Case 3: follower's log is too short:
-						// 	nextIndex = XLen
-						findLastIndexOfTerm := func(term int) int {
-							index := -1
-							for i := 1; i < len(rf.Log); i++ {
-								if rf.Log[i].Term == term {
-									index = i + rf.lastIncludedIndex
-								}
-							}
-
-							return index
-						}
-						if reply.XLen != 0 {
-							// Case 3
-							rf.nextIndex[peer] = reply.XLen
-						} else {
-							// Look for XTerm in leader log
-							index := findLastIndexOfTerm(reply.XTerm)
-
-							if index == -1 {
-								// Case 1
-								rf.nextIndex[peer] = reply.XIndex
-							} else {
-								// Case 2
-								rf.nextIndex[peer] = index + 1
-							}
-						}
-
-						if rf.status == Leader {
-							go func() {
-								time.Sleep(10 * time.Millisecond)
-								if rf.status == Leader {
-									rf.sendHeartbeat()
-								}
-							}()
-						}
-					}
-				}
+				rf.handleSendAppendEntries(peer, &args)
 			}(peer)
 		}
 	}
