@@ -33,7 +33,7 @@ import (
 )
 
 var debugMode = false // Set to true to enable debug logging
-var debug3D = true    // Debug flag for part 3D
+var debug3D = false   // Debug flag for part 3D
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -432,6 +432,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for i, entry := range args.Entries {
 		logicalLogIndex := args.PrevLogIndex + 1 + i // logical Raft index where this entry should go
 		physicalLogIndex := logicalLogIndex - rf.lastIncludedIndex
+		if physicalLogIndex < 1 {
+			if debug3D {
+				log.Printf("appendEntries for peer %d: negative physical log index=%d", rf.me, physicalLogIndex)
+			}
+			continue
+		}
+
 		if physicalLogIndex >= len(rf.Log) {
 			// Entry doesn't exist in log, append it and all remaining entries
 			rf.Log = append(rf.Log, args.Entries[i:]...)
