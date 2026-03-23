@@ -349,9 +349,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // CurrentTerm, for leader to update itself
 	Success bool // True if follower contained entry matchine prevLogIndex and prevLogTerm
-	XTerm   int  //term in the conflicting entry (if any)
-	XIndex  int  //index of first entry with that term (if any)
-	XLen    int  //log length
+	XTerm   int  // Term in the conflicting entry (if any)
+	XIndex  int  // Index of first entry with that term (if any)
+	XLen    int  // Index where the next entry should go if PrevLogIndex is beyond end of log
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -381,7 +381,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		log.Printf("server %d in appendEntries: lastLogIndex= %d, prevlogindex= %d, last included= %d", rf.me, lastLogIndex, args.PrevLogIndex, rf.lastIncludedIndex)
 	}
 
-	// Case 1: Leader is referring to an entry beyond the end of our log → failure
+	// Case 1: Leader is referring to an entry beyond the end of our log
 	if args.PrevLogIndex > lastLogIndex {
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
@@ -452,7 +452,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.persist()
 
-	//  If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// Update commit index if it has increased
 	if args.LeaderCommit > rf.commitIndex {
 		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
 		if args.LeaderCommit < lastNewEntryIndex {
@@ -593,8 +593,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		log.Printf("server %d: Starting command %v at index %d\n", rf.me, command, index)
 	}
 
-	rf.sendHeartbeat(true)
-
 	return index, term, isLeader
 }
 
@@ -620,30 +618,28 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// This function checks to see if an election for a new leader needs to occur
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		// Your code here (3A)
+
+		// Followers wait for randomized election timeouts
+		randomDuration := 300 + (rand.Int31() % 151)
+		timeout := time.Duration(randomDuration) * time.Millisecond
+		time.Sleep(timeout)
+
 		rf.mu.Lock()
 		status := rf.status
+		lastHeartbeat := rf.lastHeartbeat
 		rf.mu.Unlock()
 
-		if status != Leader {
-			// Followers wait for randomized election timeouts
-			ms := 500 + (rand.Int63() % 301)
-			timeout := time.Duration(ms) * time.Millisecond
-			rf.mu.Lock()
-			lastHeartbeat := rf.lastHeartbeat // Capture under lock
-			rf.mu.Unlock()
-
-			if time.Since(lastHeartbeat) >= timeout &&
-				rf.status != Leader &&
-				len(rf.peers) > 1 {
-				rf.startElection()
-			}
-
-			time.Sleep(timeout)
+		if status != Leader &&
+			time.Since(lastHeartbeat) >= timeout &&
+			len(rf.peers) > 1 {
+			rf.startElection()
 		}
 	}
+
 	rf.mu.Lock()
 	rf.status = Follower
 	rf.mu.Unlock()
@@ -658,56 +654,83 @@ func (rf *Raft) startElection() {
 	currentTerm := rf.CurrentTerm // Store current term for consistency
 	rf.persist()
 
-	var votes int32 = 1
-	lastLogTerm := rf.lastIncludedTerm
-	if len(rf.Log) > 1 {
-		lastLogTerm = rf.Log[len(rf.Log)-1].Term
-	}
-
+	votes := 1
+	lastLogTerm := rf.lastLogIndexTerm()
 	args := RequestVoteArgs{
 		Term:         currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: len(rf.Log) - 1 + rf.lastIncludedIndex,
+		LastLogIndex: rf.lastLogIndex(),
 		LastLogTerm:  lastLogTerm,
 	}
 	rf.mu.Unlock()
 
 	for peer := range rf.peers {
 		if peer != rf.me {
-			go func(peer int) {
-				reply := RequestVoteReply{}
-				if rf.sendRequestVote(peer, &args, &reply) {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-
-					if rf.CurrentTerm != args.Term {
-						// Election has moved on
-						return
-					}
-					if reply.Term > rf.CurrentTerm {
-						rf.CurrentTerm = reply.Term
-						rf.status = Follower
-						rf.VotedFor = -1
-						rf.lastHeartbeat = time.Now()
-						rf.persist()
-						return
-					}
-					if reply.VoteGranted && rf.CurrentTerm == args.Term {
-						if atomic.AddInt32(&votes, 1) > int32(len(rf.peers)/2) { // Use atomic for safe increment
-							if rf.status == Candidate {
-								rf.becomeLeader()
-								return
-							}
-						}
-					}
-				}
-			}(peer)
+			go rf.handleRequestVote(peer, args, &votes)
 		}
 	}
 }
 
+func (rf *Raft) handleRequestVote(peer int, args RequestVoteArgs, votes *int) {
+	reply := RequestVoteReply{}
+	if !rf.sendRequestVote(peer, &args, &reply) {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.CurrentTerm != args.Term || rf.status != Candidate {
+		return // stale reply or no longer candidate
+	}
+
+	if rf.stepDown(reply.Term) {
+		return
+	}
+
+	if !reply.VoteGranted {
+		return
+	}
+
+	*votes++
+	if *votes > len(rf.peers)/2 {
+		rf.becomeLeader()
+	}
+}
+
+// stepDown transitions this server to follower at newTerm.
+// Caller must hold rf.mu.
+func (rf *Raft) stepDown(newTerm int) bool {
+	if newTerm <= rf.CurrentTerm {
+		return false
+	}
+
+	rf.CurrentTerm = newTerm
+	rf.status = Follower
+	rf.VotedFor = -1
+	rf.lastHeartbeat = time.Now()
+	rf.persist()
+
+	return true
+}
+
+// Caller must hold rf.mu.
+func (rf *Raft) lastLogIndexTerm() int {
+	if len(rf.Log) > 1 {
+		return rf.Log[len(rf.Log)-1].Term
+	}
+
+	return rf.lastIncludedTerm
+}
+
+// Caller must hold rf.mu.
+func (rf *Raft) lastLogIndex() int {
+	return len(rf.Log) - 1 + rf.lastIncludedIndex
+}
+
 // Check if we can update commitIndex
 // Find the highest N such that a majority of matchIndex[i] ≥ N and log[N].term == currentTerm
+// Caller must hold rf.mu.
 func (rf *Raft) updateCommitIndex() {
 	for N := len(rf.Log) - 1 + rf.lastIncludedIndex; N > rf.commitIndex; N-- {
 		physicalIndex := N - rf.lastIncludedIndex
@@ -762,7 +785,6 @@ func (rf *Raft) handleSendAppendEntries(peer int, args *AppendEntriesArgs) {
 			}
 
 			rf.updateCommitIndex()
-
 		} else {
 			if debugMode {
 				log.Printf("server %d in handleSendAppendEntries: AppendEntries failed for peer %d: prevLogIndex= %d, new nextIndex= %d", rf.me, peer, args.PrevLogIndex, rf.nextIndex[peer])
@@ -772,118 +794,120 @@ func (rf *Raft) handleSendAppendEntries(peer int, args *AppendEntriesArgs) {
 			// If append failed because of log inconsistency, decrement nextIndex and retry
 			// This "walking back" approach guarantees that eventually the leader will find
 			// the point where the logs match (keep going back if conflicting)
-
-			// 	Case 1: leader doesn't have XTerm:
-			// 	nextIndex = XIndex
-			//   Case 2: leader has XTerm:
-			// 	nextIndex = leader's last entry for XTerm
-			//   Case 3: follower's log is too short:
-			// 	nextIndex = XLen
-			findLastIndexOfTerm := func(term int) int {
-				index := -1
-				for i := 1; i < len(rf.Log); i++ {
-					if rf.Log[i].Term == term {
-						index = i + rf.lastIncludedIndex
-					}
-				}
-
-				return index
-			}
 			if reply.XLen != 0 {
-				// Case 3
+				// Case 3: follower's log is too short
 				rf.nextIndex[peer] = reply.XLen
 			} else {
 				// Look for XTerm in leader log
-				index := findLastIndexOfTerm(reply.XTerm)
+				index := rf.findLastIndexOfTerm(reply.XTerm)
 
 				if index == -1 {
-					// Case 1
+					// Case 1: leader doesn't have XTerm
 					rf.nextIndex[peer] = reply.XIndex
 				} else {
-					// Case 2
+					// Case 2: leader has XTerm
 					rf.nextIndex[peer] = index + 1
 				}
-			}
-
-			if rf.status == Leader {
-				go func() {
-					time.Sleep(10 * time.Millisecond)
-					if rf.status == Leader {
-						rf.sendHeartbeat(true)
-					}
-				}()
 			}
 		}
 	}
 }
 
+func (rf *Raft) findLastIndexOfTerm(term int) int {
+	index := -1
+	for i := 1; i < len(rf.Log); i++ {
+		if rf.Log[i].Term == term {
+			index = i + rf.lastIncludedIndex
+		}
+	}
+
+	if index == -1 && term == rf.lastIncludedTerm {
+		return rf.lastIncludedIndex
+	}
+
+	return index
+}
+
+// handleInstallSnapshot sends InstallSnapshot if peer is behind
 func (rf *Raft) handleInstallSnapshot(peer int) {
 	rf.mu.Lock()
-	if rf.status != Leader {
+	if rf.status != Leader { // Only leaders can send snapshots
 		rf.mu.Unlock()
 		return
 	}
 
+	logicalNextIndex := rf.nextIndex[peer]
+	if logicalNextIndex > rf.lastIncludedIndex { // This peer doesn't need a snapshot
+		rf.mu.Unlock()
+		return
+	}
+
+	if debugMode {
+		log.Printf("server %d in sendHeartbeat to peer %d: send install snapshot called", rf.me, peer)
+	}
+
+	data := append([]byte(nil), rf.snapshot...)
 	args := InstallSnapshotArgs{
 		Term:              rf.CurrentTerm,
 		LeaderId:          rf.me,
 		LastIncludedIndex: rf.lastIncludedIndex,
 		LastIncludedTerm:  rf.lastIncludedTerm,
-		Data:              rf.snapshot,
+		Data:              data,
 	}
-	reply := InstallSnapshotReply{}
 	rf.mu.Unlock()
 
-	if rf.sendInstallSnapshot(peer, &args, &reply) {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
+	reply := InstallSnapshotReply{}
+	if !rf.sendInstallSnapshot(peer, &args, &reply) {
+		return
+	}
 
-		// Check we're still leader in same term
-		if rf.status != Leader || rf.CurrentTerm != args.Term {
-			return
-		}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-		if reply.Term > rf.CurrentTerm {
-			rf.CurrentTerm = reply.Term
-			rf.status = Follower
-			rf.VotedFor = -1
-			rf.lastHeartbeat = time.Now()
-			rf.persist()
-			return
-		}
+	// Check we're still leader in same term
+	if rf.status != Leader || rf.CurrentTerm != args.Term {
+		return
+	}
 
-		rf.matchIndex[peer] = rf.lastIncludedIndex
-		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+	if rf.stepDown(reply.Term) {
+		return
+	}
 
-		if debug3D {
-			log.Printf("handleInstallSnapshot: in here for peer %d: match idx= %d, next index= %d", peer, rf.matchIndex[peer], rf.nextIndex[peer])
-		}
+	rf.updateMatchAndNextIndex(peer, args.LastIncludedIndex)
+
+	if debug3D {
+		log.Printf("handleInstallSnapshot: in here for peer %d: match idx= %d, next index= %d", peer, rf.matchIndex[peer], rf.nextIndex[peer])
 	}
 }
 
-func (rf *Raft) sendHeartbeat(replicateLog bool) {
-	if debugMode {
-		log.Printf("server %d in sendHeartbeat: commitIndex= %d, lastApplied= %d\n", rf.me, rf.commitIndex, rf.lastApplied)
+// Caller must hold rf.mu.
+func (rf *Raft) updateMatchAndNextIndex(peer int, newMatchIndex int) {
+	if newMatchIndex > rf.matchIndex[peer] {
+		rf.matchIndex[peer] = newMatchIndex
 	}
+	rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+}
 
-	term := rf.CurrentTerm
+func (rf *Raft) sendHeartbeat() {
+	// if debugMode {
+	// 	log.Printf("server %d in sendHeartbeat: commitIndex= %d, lastApplied= %d\n", rf.me, rf.commitIndex, rf.lastApplied)
+	// }
+
 	for peer := range rf.peers {
 		if peer != rf.me {
 			go func(peer int) {
 				rf.mu.Lock()
+				term := rf.CurrentTerm
 
-				if rf.status != Leader || rf.CurrentTerm != term {
+				if rf.status != Leader { // Only leader should send heartbeat
 					rf.mu.Unlock()
 					return
 				}
 
 				logicalNextIndex := rf.nextIndex[peer]
 
-				// Check if the follower is far behind first
+				// Check if the follower needs to install snapshot
 				if logicalNextIndex <= rf.lastIncludedIndex {
-					if debugMode {
-						log.Printf("server %d in sendHeartbeat to peer %d: send install snapshot called", rf.me, peer)
-					}
 					rf.mu.Unlock()
 
 					rf.handleInstallSnapshot(peer)
@@ -891,15 +915,7 @@ func (rf *Raft) sendHeartbeat(replicateLog bool) {
 				}
 
 				logicalPrevLogIndex := logicalNextIndex - 1
-
-				// Use logical indices since when snapshotting, the physical indices can cause prevLogIndex to be 0, which will lead to invalid bounds with the physical indices
-				var prevTerm int
-				if logicalPrevLogIndex == rf.lastIncludedIndex {
-					prevTerm = rf.lastIncludedTerm
-				} else {
-					physicalPrevIndex := logicalPrevLogIndex - rf.lastIncludedIndex
-					prevTerm = rf.Log[physicalPrevIndex].Term
-				}
+				prevTerm := rf.getPrevLogTerm(logicalPrevLogIndex)
 
 				if debugMode {
 					log.Printf("server %d in sendHeartbeat to peer %d: prevlogindex = %d, logical prevlogindex = %d, log length (including dummy) = %d, physical next index = %d, lastincludedindex = %d", rf.me, peer, logicalPrevLogIndex-rf.lastIncludedIndex, logicalPrevLogIndex, len(rf.Log), logicalNextIndex-rf.lastIncludedIndex, rf.lastIncludedIndex)
@@ -915,16 +931,13 @@ func (rf *Raft) sendHeartbeat(replicateLog bool) {
 				args.PrevLogIndex = logicalPrevLogIndex
 				args.PrevLogTerm = prevTerm
 
-				if replicateLog { // For log
-					logLength := len(rf.Log)
-					physicalNextIndex := logicalNextIndex - rf.lastIncludedIndex
-					// Make a copy of the log entries to avoid concurrent modification during RPC
-					entries := make([]LogEntry, logLength-physicalNextIndex)
-					copy(entries, rf.Log[physicalNextIndex:])
-					args.Entries = entries
-				} else { // For heartbeat
-					args.Entries = []LogEntry{}
-				}
+				// Log replication
+				logLength := len(rf.Log)
+				physicalNextIndex := logicalNextIndex - rf.lastIncludedIndex
+				// Make a copy of the log entries to avoid concurrent modification during RPC
+				entries := make([]LogEntry, logLength-physicalNextIndex)
+				copy(entries, rf.Log[physicalNextIndex:])
+				args.Entries = entries
 
 				rf.mu.Unlock()
 
@@ -934,29 +947,44 @@ func (rf *Raft) sendHeartbeat(replicateLog bool) {
 	}
 }
 
-func (rf *Raft) becomeLeader() { // Called while lock is held
+// Use logical indices since with snapshotting, the physical indices can cause prevLogIndex to be 0,
+// which will lead to invalid bounds with the physical indices
+// Caller must hold rf.mu.
+func (rf *Raft) getPrevLogTerm(logicalPrevLogIndex int) int {
+	if logicalPrevLogIndex == rf.lastIncludedIndex {
+		return rf.lastIncludedTerm
+	}
+
+	physicalPrevIndex := logicalPrevLogIndex - rf.lastIncludedIndex
+	return rf.Log[physicalPrevIndex].Term
+}
+
+// Caller must hold rf.mu.
+func (rf *Raft) becomeLeader() {
 	// Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server
 	if debugMode || debug3D {
 		log.Printf("server %d became leader: term %d\n", rf.me, rf.CurrentTerm)
 	}
+
 	numPeers := len(rf.peers)
 	rf.status = Leader
 	rf.nextIndex = make([]int, numPeers)
 	rf.matchIndex = make([]int, numPeers)
+
 	for i := range rf.peers {
 		rf.nextIndex[i] = rf.lastIncludedIndex + len(rf.Log)
 		rf.matchIndex[i] = rf.lastIncludedIndex // gauranteed to be replicated up to the last index included in the snapshot
 	}
-	rf.sendHeartbeat(true)
 }
 
 func (rf *Raft) heartbeat() {
 	for !rf.killed() {
 		if rf.status == Leader {
 			// Leaders send heartbeats at fixed shorter intervals
-			rf.sendHeartbeat(true)
-			time.Sleep(200 * time.Millisecond)
+			rf.sendHeartbeat()
 		}
+
+		time.Sleep(100 * time.Millisecond)
 	}
 	rf.mu.Lock()
 	rf.status = Follower
@@ -990,7 +1018,7 @@ func (rf *Raft) applyCommitted() {
 		}
 		rf.mu.Unlock()
 
-		// Send without holding lock
+		// Send without holding lock since channels can block
 		for _, msg := range entriesToApply {
 			rf.applyCh <- msg
 		}
