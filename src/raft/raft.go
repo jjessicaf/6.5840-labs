@@ -198,12 +198,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	physicalIndex := index - rf.lastIncludedIndex
+	physicalIndex := rf.toPhysicalIndex(index)
 	if physicalIndex >= len(rf.Log) {
 		// Snapshot beyond our log – keep only dummy
 		rf.lastIncludedIndex = index
 		if len(rf.Log) > 1 {
-			rf.lastIncludedTerm = rf.Log[len(rf.Log)-1].Term
+			rf.lastIncludedTerm = rf.termAt(len(rf.Log)-1, false)
 		}
 		rf.Log = []LogEntry{{Term: 0}}
 		rf.snapshot = snapshot
@@ -211,7 +211,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	rf.lastIncludedTerm = rf.Log[physicalIndex].Term
+	rf.lastIncludedTerm = rf.termAt(physicalIndex, false)
 	rf.lastIncludedIndex = index
 
 	newLog := make([]LogEntry, 1)
@@ -261,6 +261,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.VotedFor = -1
 		rf.status = Follower
 		rf.persist()
+		// Doesn't update lastHeartbeat since no new leader has been selected
 	}
 
 	/*
@@ -282,8 +283,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	var lastLogIndex int
 	var lastLogTerm int
 	if len(rf.Log) > 1 {
-		lastLogIndex = rf.lastIncludedIndex + len(rf.Log) - 1
-		lastLogTerm = rf.Log[len(rf.Log)-1].Term
+		lastLogIndex = rf.lastLogIndex()
+		lastLogTerm = rf.lastLogIndexTerm()
 	} else {
 		lastLogIndex = rf.lastIncludedIndex
 		lastLogTerm = rf.lastIncludedTerm
@@ -358,8 +359,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	lastLogIndex := len(rf.Log) - 1 + rf.lastIncludedIndex
-
 	// Reply false if term < currentTerm
 	if args.Term < rf.CurrentTerm {
 		reply.Success = false
@@ -367,51 +366,74 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.Term > rf.CurrentTerm {
-		rf.CurrentTerm = args.Term
-		rf.VotedFor = -1
-		rf.status = Follower
-		rf.persist()
-	}
+	rf.stepDown(args.Term)
 
 	rf.lastHeartbeat = time.Now()
 	rf.status = Follower
 
-	if debugMode {
-		log.Printf("server %d in appendEntries: lastLogIndex= %d, prevlogindex= %d, last included= %d", rf.me, lastLogIndex, args.PrevLogIndex, rf.lastIncludedIndex)
+	if !rf.matchPrevLog(args, reply) {
+		return
 	}
+
+	// If an existing entry conflicts with a new one (same index but different terms),
+	// delete the existing entry and all that follow it and append any new entries not already in the log
+	for i, entry := range args.Entries {
+		logicalLogIndex := args.PrevLogIndex + 1 + i // logical Raft index where this entry should go
+		physicalLogIndex := rf.toPhysicalIndex(logicalLogIndex)
+		if physicalLogIndex < 1 { // For safety
+			continue
+		}
+
+		if physicalLogIndex >= len(rf.Log) {
+			// Entry doesn't exist in log, append it and all remaining entries
+			rf.Log = append(rf.Log, args.Entries[i:]...)
+			break
+		} else if rf.termAt(physicalLogIndex, false) != entry.Term {
+			// Term mismatch - truncate and append from here
+			rf.Log = rf.Log[:physicalLogIndex]
+			rf.Log = append(rf.Log, args.Entries[i:]...)
+			break
+		}
+	}
+	rf.persist()
+
+	// Update commit index if it has increased
+	rf.updateFollowerCommitIndex(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+
+	reply.Term = rf.CurrentTerm
+	reply.Success = true
+}
+
+func (rf *Raft) toPhysicalIndex(logical int) int {
+	return logical - rf.lastIncludedIndex
+}
+
+// Caller must hold rf.mu.
+func (rf *Raft) updateFollowerCommitIndex(leaderCommit, lastNewIndex int) {
+	if leaderCommit > rf.commitIndex {
+		lastNewEntryIndex := lastNewIndex
+		if leaderCommit < lastNewEntryIndex {
+			rf.commitIndex = leaderCommit
+		} else {
+			rf.commitIndex = lastNewEntryIndex
+		}
+	}
+}
+
+// If the arguments don't match the log, return false.
+// Caller must hold rf.mu.
+func (rf *Raft) matchPrevLog(args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	lastLogIndex := rf.lastLogIndex()
 
 	// Case 1: Leader is referring to an entry beyond the end of our log
 	if args.PrevLogIndex > lastLogIndex {
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
 		reply.XLen = lastLogIndex + 1 // the index where the next entry should go
-		return
+		return false
 	}
 
-	if args.PrevLogIndex > rf.lastIncludedIndex {
-		localTerm := rf.Log[args.PrevLogIndex-rf.lastIncludedIndex].Term
-
-		if localTerm != args.PrevLogTerm {
-			if debugMode {
-				log.Printf("server %d in appendEntries: FAIL - local term= %d, prevlogterm= %d", rf.me, localTerm, args.PrevLogTerm)
-			}
-
-			reply.Success = false
-			reply.Term = rf.CurrentTerm
-			reply.XTerm = localTerm
-
-			// Find first index of this term in the conflicting run
-			i := args.PrevLogIndex
-			for i > rf.lastIncludedIndex &&
-				rf.Log[i-rf.lastIncludedIndex].Term == localTerm {
-				i--
-			}
-
-			reply.XIndex = i + 1 // first index of the conflicting term
-			return
-		}
-	} else if args.PrevLogIndex == rf.lastIncludedIndex {
+	if args.PrevLogIndex == rf.lastIncludedIndex {
 		// PrevLogIndex points to the last included entry in snapshot
 		if rf.lastIncludedTerm != args.PrevLogTerm {
 			if debugMode {
@@ -422,48 +444,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = rf.CurrentTerm
 			reply.XTerm = rf.lastIncludedTerm
 			reply.XIndex = rf.lastIncludedIndex
-			return
+			return false
 		}
+		return true
 	}
 
-	// If an existing entry conflicts with a new one (same index but different terms),
-	// delete the existing entry and all that follow it
-	// Append any new entries not already in the log
-	for i, entry := range args.Entries {
-		logicalLogIndex := args.PrevLogIndex + 1 + i // logical Raft index where this entry should go
-		physicalLogIndex := logicalLogIndex - rf.lastIncludedIndex
-		if physicalLogIndex < 1 {
-			if debug3D {
-				log.Printf("appendEntries for peer %d: negative physical log index=%d", rf.me, physicalLogIndex)
-			}
-			continue
+	term := rf.termAt(args.PrevLogIndex, true)
+	if term != args.PrevLogTerm {
+		if debugMode {
+			log.Printf("server %d in appendEntries: FAIL - local term= %d, prevlogterm= %d", rf.me, term, args.PrevLogTerm)
 		}
 
-		if physicalLogIndex >= len(rf.Log) {
-			// Entry doesn't exist in log, append it and all remaining entries
-			rf.Log = append(rf.Log, args.Entries[i:]...)
-			break
-		} else if rf.Log[physicalLogIndex].Term != entry.Term {
-			// Term mismatch - truncate and append from here
-			rf.Log = rf.Log[:physicalLogIndex]
-			rf.Log = append(rf.Log, args.Entries[i:]...)
-			break
-		}
-	}
-	rf.persist()
+		reply.Success = false
+		reply.Term = rf.CurrentTerm
+		reply.XTerm = term
 
-	// Update commit index if it has increased
-	if args.LeaderCommit > rf.commitIndex {
-		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
-		if args.LeaderCommit < lastNewEntryIndex {
-			rf.commitIndex = args.LeaderCommit
-		} else {
-			rf.commitIndex = lastNewEntryIndex
+		// Find first index of this term in the conflicting run
+		i := args.PrevLogIndex
+		for i > rf.lastIncludedIndex &&
+			rf.termAt(i, true) == term {
+			i--
 		}
+
+		reply.XIndex = i + 1 // first index of the conflicting term
+		return false
 	}
 
-	reply.Term = rf.CurrentTerm
-	reply.Success = true
+	return true
+}
+
+func (rf *Raft) termAt(index int, logical bool) int {
+	if logical {
+		return rf.Log[rf.toPhysicalIndex(index)].Term
+	}
+
+	return rf.Log[index].Term
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -515,7 +530,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	appendStart := -1
 	for i := 1; i < len(rf.Log); i++ {
 		logicalIndex := i + rf.lastIncludedIndex
-		if logicalIndex == args.LastIncludedIndex && rf.Log[i].Term == args.LastIncludedTerm {
+		if logicalIndex == args.LastIncludedIndex && rf.termAt(i, false) == args.LastIncludedTerm {
 			appendStart = i + 1
 			break
 		}
@@ -586,7 +601,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.Log = append(rf.Log, entry)
 	rf.persist()
 
-	index = len(rf.Log) - 1 + rf.lastIncludedIndex
+	index = rf.lastLogIndex()
 	term = rf.CurrentTerm
 
 	if debugMode || debug3D {
@@ -608,6 +623,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	rf.status = Follower
 	rf.VotedFor = -1
 	rf.persist()
@@ -723,18 +741,18 @@ func (rf *Raft) lastLogIndexTerm() int {
 	return rf.lastIncludedTerm
 }
 
-// Caller must hold rf.mu.
+// Returns the last logical index. Caller must hold rf.mu.
 func (rf *Raft) lastLogIndex() int {
 	return len(rf.Log) - 1 + rf.lastIncludedIndex
 }
 
-// Check if we can update commitIndex
-// Find the highest N such that a majority of matchIndex[i] ≥ N and log[N].term == currentTerm
+// Check if we can update commitIndex.
+// Find the highest N such that a majority of matchIndex[i] ≥ N and log[N].term == currentTerm.
 // Caller must hold rf.mu.
-func (rf *Raft) updateCommitIndex() {
-	for N := len(rf.Log) - 1 + rf.lastIncludedIndex; N > rf.commitIndex; N-- {
-		physicalIndex := N - rf.lastIncludedIndex
-		if physicalIndex > 0 && rf.Log[physicalIndex].Term == rf.CurrentTerm {
+func (rf *Raft) updateLeaderCommitIndex() {
+	for N := rf.lastLogIndex(); N > rf.commitIndex; N-- {
+		physicalIndex := rf.toPhysicalIndex(N)
+		if physicalIndex > 0 && rf.termAt(physicalIndex, false) == rf.CurrentTerm {
 			count := 1
 			for i := range rf.peers {
 				if i != rf.me && rf.matchIndex[i] >= N {
@@ -762,12 +780,7 @@ func (rf *Raft) handleSendAppendEntries(peer int, args *AppendEntriesArgs) {
 			return
 		}
 
-		if reply.Term > rf.CurrentTerm {
-			rf.CurrentTerm = reply.Term
-			rf.status = Follower
-			rf.VotedFor = -1
-			rf.lastHeartbeat = time.Now()
-			rf.persist()
+		if rf.stepDown(reply.Term) {
 			return
 		}
 
@@ -777,14 +790,15 @@ func (rf *Raft) handleSendAppendEntries(peer int, args *AppendEntriesArgs) {
 			}
 
 			// Update nextIndex and matchIndex for the follower
-			rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
-			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+			// rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+			// rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+			rf.updateMatchAndNextIndex(peer, args.PrevLogIndex+len(args.Entries))
 
 			if debugMode {
 				log.Printf("handleSendAppendEntries: in here for peer %d: match idx= %d, next index= %d", peer, rf.matchIndex[peer], rf.nextIndex[peer])
 			}
 
-			rf.updateCommitIndex()
+			rf.updateLeaderCommitIndex()
 		} else {
 			if debugMode {
 				log.Printf("server %d in handleSendAppendEntries: AppendEntries failed for peer %d: prevLogIndex= %d, new nextIndex= %d", rf.me, peer, args.PrevLogIndex, rf.nextIndex[peer])
@@ -816,7 +830,7 @@ func (rf *Raft) handleSendAppendEntries(peer int, args *AppendEntriesArgs) {
 func (rf *Raft) findLastIndexOfTerm(term int) int {
 	index := -1
 	for i := 1; i < len(rf.Log); i++ {
-		if rf.Log[i].Term == term {
+		if rf.termAt(i, false) == term {
 			index = i + rf.lastIncludedIndex
 		}
 	}
@@ -843,7 +857,7 @@ func (rf *Raft) handleInstallSnapshot(peer int) {
 	}
 
 	if debugMode {
-		log.Printf("server %d in sendHeartbeat to peer %d: send install snapshot called", rf.me, peer)
+		log.Printf("server %d in handleInstallSnapshot to peer %d: send install snapshot called", rf.me, peer)
 	}
 
 	data := append([]byte(nil), rf.snapshot...)
@@ -889,10 +903,6 @@ func (rf *Raft) updateMatchAndNextIndex(peer int, newMatchIndex int) {
 }
 
 func (rf *Raft) sendHeartbeat() {
-	// if debugMode {
-	// 	log.Printf("server %d in sendHeartbeat: commitIndex= %d, lastApplied= %d\n", rf.me, rf.commitIndex, rf.lastApplied)
-	// }
-
 	for peer := range rf.peers {
 		if peer != rf.me {
 			go func(peer int) {
@@ -933,7 +943,7 @@ func (rf *Raft) sendHeartbeat() {
 
 				// Log replication
 				logLength := len(rf.Log)
-				physicalNextIndex := logicalNextIndex - rf.lastIncludedIndex
+				physicalNextIndex := rf.toPhysicalIndex(logicalNextIndex)
 				// Make a copy of the log entries to avoid concurrent modification during RPC
 				entries := make([]LogEntry, logLength-physicalNextIndex)
 				copy(entries, rf.Log[physicalNextIndex:])
@@ -955,8 +965,7 @@ func (rf *Raft) getPrevLogTerm(logicalPrevLogIndex int) int {
 		return rf.lastIncludedTerm
 	}
 
-	physicalPrevIndex := logicalPrevLogIndex - rf.lastIncludedIndex
-	return rf.Log[physicalPrevIndex].Term
+	return rf.termAt(logicalPrevLogIndex, true)
 }
 
 // Caller must hold rf.mu.
@@ -999,6 +1008,10 @@ func (rf *Raft) applyCommitted() {
 
 		rf.mu.Lock()
 
+		if rf.lastApplied < rf.lastIncludedIndex {
+			rf.lastApplied = rf.lastIncludedIndex
+		}
+
 		// Check if there are new entries to apply
 		var entriesToApply []ApplyMsg
 		for rf.commitIndex > rf.lastApplied {
@@ -1007,7 +1020,7 @@ func (rf *Raft) applyCommitted() {
 				log.Printf("server %d applying committed entries: term %d\n", rf.me, rf.CurrentTerm)
 			}
 
-			physicalIndex := rf.lastApplied - rf.lastIncludedIndex
+			physicalIndex := rf.toPhysicalIndex(rf.lastApplied)
 			if physicalIndex > 0 && physicalIndex < len(rf.Log) {
 				entriesToApply = append(entriesToApply, ApplyMsg{
 					CommandValid: true,
