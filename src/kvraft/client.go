@@ -1,13 +1,19 @@
 package kvraft
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
 
+	"6.5840/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	seq    int // Latest serial number for commands from this client
+	leader int // Current known leader index
+	id     int64
 }
 
 func nrand() int64 {
@@ -21,6 +27,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.seq = 0
+	ck.id = nrand()
+	ck.leader = 0
+
 	return ck
 }
 
@@ -37,7 +47,29 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key:      key,
+		Seq:      ck.seq,
+		ClientId: ck.id,
+	}
+
+	ck.seq++
+
+	for {
+		reply := GetReply{}
+		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
+		if ok && reply.Err == OK {
+			return reply.Value
+		} else if ok && reply.Err == ErrNoKey {
+			return ""
+		}
+
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+
+		if ck.leader == 0 { // Only sleep after going through all the servers once
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 // shared by Put and Append.
@@ -50,6 +82,28 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Seq:      ck.seq,
+		ClientId: ck.id,
+	}
+
+	ck.seq++
+
+	for {
+		reply := PutAppendReply{}
+		ok := ck.servers[ck.leader].Call("KVServer."+op, &args, &reply)
+		if ok && reply.Err == OK {
+			return
+		}
+
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+
+		if ck.leader == 0 { // Only sleep after going through all the servers once
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
