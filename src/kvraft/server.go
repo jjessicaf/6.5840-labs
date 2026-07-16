@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,8 @@ type KVServer struct {
 	kv           map[string]string
 	notify       map[int]chan Op // Map command ID to notify channel for each command
 	requestCache map[int64]int   // Client ID to last sequence number
+	lastApplied  int
+	persister    *raft.Persister
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -203,6 +206,17 @@ func (kv *KVServer) update() {
 		}
 
 		kv.mu.Lock()
+		if msg.SnapshotValid && msg.SnapshotIndex > kv.lastApplied {
+			kv.readSnapshot(msg.Snapshot) // restore kv.kv + kv.requestCache from bytes
+			kv.lastApplied = msg.SnapshotIndex
+			kv.mu.Unlock()
+			continue
+		}
+
+		if !msg.CommandValid {
+			kv.mu.Unlock()
+			continue
+		}
 
 		op := msg.Command.(Op)
 
@@ -215,6 +229,13 @@ func (kv *KVServer) update() {
 			kv.apply(&op)
 		} else if op.OpType == GetOp {
 			op.Value = kv.get(op.Key)
+		}
+
+		kv.lastApplied = msg.CommandIndex
+
+		// Handle snapshot after all states are updated
+		if kv.shouldSnapshot() {
+			kv.snapshot()
 		}
 
 		ch, ok := kv.notify[msg.CommandIndex]
@@ -263,6 +284,50 @@ func (kv *KVServer) duplicate(clientId int64, currentSeq int) bool {
 	return exists && currentSeq <= seq
 }
 
+func (kv *KVServer) shouldSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+
+	return kv.persister.RaftStateSize() >= kv.maxraftstate
+}
+
+func (kv *KVServer) snapshot() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kv)
+	e.Encode(kv.requestCache)
+	e.Encode(kv.lastApplied)
+	kv.rf.Snapshot(kv.lastApplied, w.Bytes())
+}
+
+// Must be called while lock is held
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	if len(snapshot) == 0 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var kvMap map[string]string
+	var requestCache map[int64]int
+	var lastApplied int
+
+	if d.Decode(&kvMap) != nil ||
+		d.Decode(&requestCache) != nil ||
+		d.Decode(&lastApplied) != nil {
+		// Should not happen if snapshot was written correctly.
+		DPrintf("server %d FAILED to decode snapshot", kv.me)
+		return
+	}
+
+	// update local vars
+	kv.kv = kvMap
+	kv.requestCache = requestCache
+	kv.lastApplied = lastApplied
+}
+
 // Returns the channel to be used for notification for waiting RPCs.
 // Must be called while lock is held.
 func (kv *KVServer) getNotifyCh(index int) chan Op {
@@ -306,7 +371,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.notify = make(map[int]chan Op)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
+	kv.readSnapshot(kv.persister.ReadSnapshot())
+	kv.rf = raft.Make(servers, me, kv.persister, kv.applyCh)
 
 	// You may need initialization code here.
 	go kv.update()
