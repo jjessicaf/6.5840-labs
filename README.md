@@ -2,6 +2,8 @@
 
 https://pdos.csail.mit.edu/6.824/labs/lab-mr.html
 
+http://nil.csail.mit.edu/6.5840/2024/index.html
+
 ## Docker
 
 ### Create docker image:
